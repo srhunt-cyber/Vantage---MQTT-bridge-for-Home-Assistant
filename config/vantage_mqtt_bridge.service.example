@@ -1,0 +1,29 @@
+[Unit]
+Description=Vantage to MQTT bridge for Home Assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run as this user (edit to match your system)
+User=srhunt64
+Group=srhunt64
+
+# Directory where vantage_mqtt_bridge.py lives
+WorkingDirectory=/home/srhunt64/services/vantage_bridge
+
+# Path to your virtualenv Python, and config file location
+ExecStart=/home/srhunt64/services/vantage_bridge/.venv/bin/python \
+  /home/srhunt64/services/vantage_bridge/vantage_mqtt_bridge.py \
+  --config /home/srhunt64/services/vantage_bridge/vantage_mqtt_bridge.yaml
+
+# Restart on failure
+Restart=on-failure
+RestartSec=5
+
+# Optional: give it some env vars if you want
+#Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

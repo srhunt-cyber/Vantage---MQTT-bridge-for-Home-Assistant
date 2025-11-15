@@ -1,0 +1,12 @@
+# Minimal Home Assistant MQTT configuration example
+# Drop this into configuration.yaml (or merge with your existing mqtt: block)
+
+mqtt:
+  broker: 192.168.1.10     # Your MQTT broker
+  port: 1883
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+
+  # Needed if you want the bridge's auto-discovery to work
+  discovery: true
+  discovery_prefix: homeassistant

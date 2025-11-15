@@ -10,3 +10,17 @@ env/
 .idea/
 .vscode/
 *.log
+
+# Local config files (keep only the .example versions in git)
+config/*.yaml
+!config/*.yaml.example
+
+# Common Python cruft
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Editors / IDE
+.vscode/
+.idea/

@@ -1,0 +1,38 @@
+# Example configuration for Vantage MQTT Bridge
+
+vantage:
+  # IP / hostname of your Vantage controller
+  host: 192.168.1.39
+  # Usually 3001 for Infusion (adjust if needed)
+  port: 3001
+  # Leave blank if your Vantage system doesn't require auth
+  username: ""
+  password: ""
+  # Seconds to wait before giving up on initial connection
+  connect_timeout: 10
+
+mqtt:
+  # IP / hostname of your MQTT broker
+  host: rtipoll.local
+  port: 1883
+  username: ""
+  password: ""
+  client_id: vantage-mqtt-bridge
+  # Base topic under which the bridge publishes
+  base_topic: vantage
+  # Home Assistant discovery prefix (HA default is "homeassistant")
+  ha_discovery_prefix: homeassistant
+  # Set to true if you want the bridge to publish HA discovery payloads
+  ha_discovery_enabled: true
+
+bridge:
+  # Optional: restrict which areas/loads are exposed.
+  # Leave both lists empty to expose everything.
+  include_areas: []
+  exclude_areas: []
+
+  # How often to resync all loads from Vantage (seconds)
+  full_sync_interval: 3600
+
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  log_level: INFO
