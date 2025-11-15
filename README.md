@@ -85,7 +85,7 @@ vantage:
   password: ""
 
 mqtt:
-  host: rtipoll.local     # Your MQTT broker host
+  host: mqtt.local     # Your MQTT broker host
   port: 1883
   username: ""            # If needed
   password: ""
@@ -108,7 +108,7 @@ You should see logs:
 ```
 INFO - Connecting to Vantage at 192.168.1.39 ...
 INFO - Vantage connected.
-INFO - MQTT connected to rtipoll.local:1883
+INFO - MQTT connected to mqtt.local:1883
 INFO - Discovering loads...
 ```
 
