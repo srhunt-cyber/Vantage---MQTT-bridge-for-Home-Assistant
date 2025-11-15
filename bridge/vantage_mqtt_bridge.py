@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
 Vantage <-> MQTT bridge
-Version 0.9.6  —  Adds Vantage Area Mapping + Name Attribute
+Version 0.9.10 (Fix for NameError regression)
 
-- FIX 1 (Flickering): Commented out _publish_bridge_offline_async() in main run loop.
-- FIX 2 (Fan Conflict): Appends '_load' to object_ids for lights with 'fan' in the name.
-- FIX 3 (Mushroom Card): Removes 'on_command_type' from discovery to use proper on/off topics.
-- FIX 4 (Regression): Corrects NameError in _publish_load_state_async (load.id -> load_id)
-- FIX 5 (Optimistic State): Publishes new state immediately in _set_level for a responsive UI.
-- FIX 6 (Area Mapping): Populates 'vantage_area' using load.area / module.area and adds 'vantage_name'.
+- FIX 10 (NameError): Corrected a NameError in _publish_load_state_async.
+  The variable 'load.id' was used instead of the passed 'load_id'.
+- FIX 9 (Dimming): Retains the "on_command_type: brightness" logic
+  to force HA to use a single command topic for all dimming actions.
 """
 
 import asyncio
@@ -22,6 +20,10 @@ import ssl
 import time
 from typing import Any, Dict, List, Optional
 from collections import defaultdict
+
+# --- INSTRUMENTATION ---
+import psutil  # REQUIRED FOR METRICS
+# --- INSTRUMENTATION ---
 
 from aiomqtt import Client, Message, Will, TLSParameters
 from aiovantage import Vantage
@@ -64,7 +66,7 @@ AVAILABILITY_TOPIC = f"{BASE_TOPIC}/bridge/status"
 
 # Timing
 RECONNECT_DELAY_MQTT = 10
-HEALTH_CHECK_INTERVAL = 30
+HEALTH_CHECK_INTERVAL = 30 # Interval for sending metrics and heartbeat
 ENABLE_FALLBACK_POLLING = True
 POLL_INTERVAL = 60
 
@@ -95,10 +97,18 @@ class VantageBridge:
 
         # Discovery & state
         self._loads: Dict[int, Any] = {}          # id -> load
-        self._is_dimmable: Dict[int, bool] = {}   # id -> bool
-        self._obj_id_map: Dict[int, str] = {}     # id -> object_id (e.g., "fixture_7")
-        self._area_names: Dict[int, str] = {}     # id -> area name
+        self._is_dimmable: Dict[int, bool] = {}  # id -> bool
+        self._obj_id_map: Dict[int, str] = {}    # id -> object_id (e.g., "fixture_7")
+        self._area_names: Dict[int, str] = {}    # id -> area name
         self._modules: Dict[int, Any] = {}        # id -> module object
+
+        # --- INSTRUMENTATION ---
+        self._start_time = time.monotonic()
+        self._pid = os.getpid()
+        self._process = psutil.Process(self._pid)
+        self._total_publishes = 0
+        self._vantage_connect_time: Optional[float] = None
+        # --- INSTRUMENTATION ---
 
         # Health
         self._last_event_time = time.monotonic()
@@ -166,32 +176,64 @@ class VantageBridge:
         if self._mqtt_client and self._mqtt_connected:
             try:
                 await self._mqtt_client.publish(topic, payload, qos=qos, retain=retain)
+                self._total_publishes += 1 # --- INSTRUMENTATION ---
             except Exception as e:
                 log.error(f"MQTT publish error on {topic}: {e}")
 
     async def _handle_mqtt_message_async(self, message: Message):
         topic = str(message.topic)
-        payload = message.payload.decode("utf-8", "ignore")
+        payload = message.payload.decode("utf-8", "ignore").strip()
         parts = topic.split("/")
 
         try:
             if len(parts) >= 4 and parts[0] == BASE_TOPIC and parts[1] == "light":
                 load_id = int(parts[2])
+                load_obj = self._loads.get(load_id)
 
-                # brightness (e.g. .../brightness/set)
+                if load_obj is None:
+                    log.warning(f"Received command for unknown load ID: {load_id}")
+                    return
+
+                is_dim = self._is_dimmable.get(load_id, True)
+                log.debug(f"Handling command for Load {load_id} ({load_obj.name}) [Dimmable: {is_dim}]: Topic={topic}, Payload='{payload}'")
+
+                # 1. Brightness Command (e.g. .../brightness/set)
+                #    FIX 9: This topic now handles ALL commands for dimmable lights (0=OFF, 1-255=ON/Dim)
                 if len(parts) >= 5 and parts[3] == "brightness" and parts[4] == "set":
-                    bri = int(payload)  # 0..255
+                    bri = int(payload)  # 0..255 from HA
+                    
+                    # Convert 0-255 to 0.0-100.0% for Vantage
                     level = max(0.0, min(100.0, (bri / 255.0) * 100.0))
+                    
+                    log.info(f"BRIGHTNESS CMD: Load {load_id} ({load_obj.name}): HA Brightness {bri} -> Vantage Level {level:.1f}%")
                     await self._set_level(load_id, level)
                     return
 
-                # on/off (e.g. .../set)
-                # This logic is now correct because FIX 3 makes HA send ON/OFF here
+                # 2. ON/OFF Command (e.g. .../set)
+                #    FIX 9: This topic is now *only* for non-dimmable lights
                 if len(parts) == 4 and parts[3] == "set":
-                    level = 100.0 if payload.strip().upper() == "ON" else 0.0
-                    await self._set_level(load_id, level)
+                    command = payload.upper()
+
+                    if is_dim:
+                        log.warning(f"ON/OFF CMD: Dimmable Load {load_id} received command on 'set' topic. This should not happen with Fix 9. Ignoring.")
+                        return
+
+                    # Handle ON/OFF for non-dimmable lights
+                    if command == "OFF":
+                        log.info(f"ON/OFF CMD: Turning non-dimmable Load {load_id} ({load_obj.name}) OFF.")
+                        await load_obj.turn_off()
+                        await self._publish_load_state_async(load_id, 0.0) 
+                        return
+                    
+                    if command == "ON":
+                        log.info(f"ON/OFF CMD: Turning non-dimmable Load {load_id} ({load_obj.name}) ON.")
+                        await load_obj.turn_on()
+                        await self._publish_load_state_async(load_id, 100.0) 
+                        return
+
         except Exception as e:
             log.error(f"Error parsing MQTT cmd {topic}='{payload}': {e}", exc_info=True)
+
 
     # ───────────── Vantage ─────────────
     async def _discover_loads(self):
@@ -298,12 +340,14 @@ class VantageBridge:
                 level = data.get("level", data.get("value"))
 
             if load is None or level is None:
+                log.debug("Event handler skipped: load or level is None.")
                 return
 
             try:
+                log.debug(f"Event received for Load {load.id} ({load.name}): Level={level}")
                 await self._publish_load_state_async(load.id, float(level))
             except Exception as e:
-                log.error(f"Event handler failed: {e}", exc_info=True)
+                log.error(f"Event handler failed for load {load.id}: {e}", exc_info=True)
 
         try:
             self._vantage.loads.subscribe(
@@ -325,8 +369,13 @@ class VantageBridge:
                 return
 
             level = max(0.0, min(100.0, float(level)))
-            log.info(f"Setting load {load_id} ({getattr(load, 'name', load_id)}) to {level:.1f}%")
-            await load.set_level(level)
+            log.info(f"VANTAGE API: Setting load {load_id} ({getattr(load, 'name', load_id)}) to {level:.1f}%")
+            
+            # FIX 9: If level is 0, call turn_off(), otherwise set_level()
+            if level == 0.0:
+                await load.turn_off()
+            else:
+                await load.set_level(level)
 
             # ==========================================================
             # <<< FIX 5 (Optimistic State) START >>>
@@ -336,7 +385,7 @@ class VantageBridge:
             # ==========================================================
 
         except Exception as e:
-            log.error(f"Error setting level for {load_id}: {e}")
+            log.error(f"Error setting level for {load_id}: {e}", exc_info=True)
 
     async def _publish_bridge_offline_async(self):
         """Publish 'offline' even if main MQTT session is down."""
@@ -381,18 +430,20 @@ class VantageBridge:
 
         is_dim = self._is_dimmable.get(load.id, True)
 
+        # ==========================================================
+        # <<< FIX 9 (Dimming) START >>>
+        # ==========================================================
+        
+        # Base payload for all lights
         payload = {
-            "name": friendly_name,  # <-- "Fixture"
-            "object_id": object_id,  # <-- "fixture_7"
+            "name": friendly_name,
+            "object_id": object_id,
             "unique_id": f"vantage_{VANTAGE_HOST}_load_{load.id}",
             "json_attributes_topic": attr_topic,
-            "state_topic": state_topic,
-            "command_topic": cmd_topic,
-            "payload_on": "ON",
-            "payload_off": "OFF",
             "availability_topic": AVAILABILITY_TOPIC,
             "payload_available": "online",
             "payload_not_available": "offline",
+            "state_topic": state_topic, # All lights report ON/OFF state
             "device": {
                 "identifiers": [f"vantage_controller_{VANTAGE_HOST}"],
                 "name": f"Vantage Controller ({VANTAGE_HOST})",
@@ -402,17 +453,29 @@ class VantageBridge:
         }
 
         if is_dim:
+            # Dimmable lights:
+            # - Use brightness topic for ALL commands (ON, OFF, Dim)
+            # - Report brightness state
             payload.update({
+                "command_topic": bri_cmd_topic, # Send all commands here
                 "brightness_state_topic": bri_state_topic,
-                "brightness_command_topic": bri_cmd_topic,
+                "brightness_command_topic": bri_cmd_topic, # Redundant, but explicit
                 "brightness_scale": 255,
-                # ==========================================================
-                # <<< FIX 3 (Mushroom Card) START >>>
-                # This line is intentionally removed to make HA send "ON"/"OFF"
-                # "on_command_type": "brightness",
-                # <<< FIX 3 (Mushroom Card) END >>>
-                # ==========================================================
+                "on_command_type": "brightness", # This is the magic key
             })
+        else:
+            # Non-dimmable lights:
+            # - Use main command topic
+            # - Use simple ON/OFF payloads
+            payload.update({
+                "command_topic": cmd_topic,
+                "payload_on": "ON",
+                "payload_off": "OFF",
+            })
+        
+        # ==========================================================
+        # <<< FIX 9 (Dimming) END >>>
+        # ==========================================================
 
         cfg_topic = self._ha_config_topic("light", object_id)
         await self._publish_async(cfg_topic, json.dumps(payload), retain=True, qos=1)
@@ -483,34 +546,103 @@ class VantageBridge:
 
     async def _publish_load_state_async(self, load_id: int, level: Optional[float]):
         if level is None:
+            log.debug(f"Skipping state publish for load {load_id}: Level is None.")
             return
-        state_topic = self._topic("light", load_id, "state")
-
+        
         # ==========================================================
-        # <<< FIX 4 (Regression) START >>>
+        # <<< FIX 10 (NameError) START >>>
         # Was: load.id, which caused NameError. Changed to load_id.
+        state_topic = self._topic("light", load_id, "state")
         bri_state_topic = self._topic("light", load_id, "brightness", "state")
-        # <<< FIX 4 (Regression) END >>>
+        # <<< FIX 10 (NameError) END >>>
         # ==========================================================
 
         is_dim = self._is_dimmable.get(load_id, True)
         state = "ON" if level > 0 else "OFF"
+        # Convert 0.0-100.0% level to 0-255 brightness for HA
         bri = str(int(round((float(level) / 100.0) * 255.0)))
 
+        load_obj = self._loads.get(load_id)
+        load_name = load_obj.name if load_obj else 'Unknown'
+        log.debug(f"STATE PUB: Load {load_id} ({load_name}): State='{state}', Brightness={bri}")
+        
+        # Always publish ON/OFF state
         await self._publish_async(state_topic, state, retain=True, qos=0)
+        
+        # Only publish brightness for dimmable lights
         if is_dim:
             await self._publish_async(bri_state_topic, bri, retain=True, qos=0)
 
     # ───────────── Health & Polling ─────────────
+    # --- INSTRUMENTATION ---
+    async def _publish_diagnostics_async(self):
+        """Gather and publish system and connection diagnostics metrics."""
+        if not self._mqtt_connected:
+            return
+
+        # 1. System Process Metrics (using psutil)
+        try:
+            cpu_pct = self._process.cpu_percent(interval=None) # Get instantaneous CPU%
+            mem_info = self._process.memory_info()
+            mem_mb = round(mem_info.rss / (1024 * 1024), 2)
+            
+            await self._publish_async(self._topic("diagnostics", "cpu_usage_pct"), str(cpu_pct), retain=False)
+            await self._publish_async(self._topic("diagnostics", "memory_usage_mb"), str(mem_mb), retain=False)
+        except Exception as e:
+            log.warning(f"Failed to gather process metrics: {e}")
+
+        # 2. Bridge Uptime
+        uptime_s = int(time.monotonic() - self._start_time)
+        await self._publish_async(self._topic("diagnostics", "uptime_s"), str(uptime_s), retain=True)
+
+        # 3. Vantage and Broker Connection Status
+        vantage_conn_status = "online" if self._vantage else "offline"
+        await self._publish_async(
+            self._topic("diagnostics", "vantage_connection_status"), 
+            vantage_conn_status, 
+            retain=True
+        )
+
+        # 4. Total Publications
+        await self._publish_async(
+            self._topic("diagnostics", "messages_published_total"), 
+            str(self._total_publishes), 
+            retain=False 
+        )
+
+        # 5. Entity Count
+        await self._publish_async(
+            self._topic("diagnostics", "entity_count"), 
+            str(len(self._loads)), 
+            retain=True
+        )
+        
+        # 6. Last Event Time (Staleness Monitor)
+        time_since_last_event = int(time.monotonic() - self._last_event_time)
+        await self._publish_async(
+            self._topic("diagnostics", "time_since_last_event_s"), 
+            str(time_since_last_event), 
+            retain=False
+        )
+
     async def _health_check_loop(self):
         log.info("Starting health check loop.")
         while not self._shutdown_requested:
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+            
+            # Existing check for a quiet Vantage stream
             if time.monotonic() - self._last_event_time > HEALTH_CHECK_INTERVAL * 2.5:
                 log.warning("Vantage event stream has been quiet for a while.")
+            
             if self._mqtt_connected:
+                # Publish the main LWT topic as a heartbeat
                 await self._publish_async(AVAILABILITY_TOPIC, "online", retain=True, qos=1)
+                
+                # Publish diagnostics metrics on the same interval
+                await self._publish_diagnostics_async()
+                
         log.info("Health check loop ended.")
+    # --- INSTRUMENTATION ---
 
     async def _poll_loop(self):
         log.info("Starting efficient polling loop.")
@@ -532,7 +664,7 @@ class VantageBridge:
 
     # ───────────── Run / Stop ─────────────
     async def run(self):
-        log.info("Starting Vantage MQTT Bridge (v0.9.6)...")
+        log.info("Starting Vantage MQTT Bridge (v0.9.10)...")
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 self._loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.stop(s)))
@@ -546,9 +678,14 @@ class VantageBridge:
         while not self._shutdown_requested:
             try:
                 log.info(f"Connecting to Vantage at {VANTAGE_HOST} ...")
+                # --- INSTRUMENTATION ---
+                vantage_conn_start_time = time.monotonic()
                 async with Vantage(VANTAGE_HOST, VANTAGE_USER, VANTAGE_PASS) as vantage:
+                    self._vantage_connect_time = time.monotonic() - vantage_conn_start_time # Calculated latency
+                # --- INSTRUMENTATION ---
                     log.info("Vantage connected.")
                     self._vantage = vantage
+                    self._last_event_time = time.monotonic()    
 
                     # Initialize areas and modules for attribute logic
                     log.info("Initializing Areas...")
@@ -631,3 +768,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    
