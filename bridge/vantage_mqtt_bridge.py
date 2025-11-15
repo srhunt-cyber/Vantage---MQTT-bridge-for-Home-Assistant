@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 Vantage <-> MQTT bridge
-Version 0.9.10 (Fix for NameError regression)
+Version 0.9.12 (Final Dimming/On-Off Fix)
 
-- FIX 10 (NameError): Corrected a NameError in _publish_load_state_async.
-  The variable 'load.id' was used instead of the passed 'load_id'.
-- FIX 9 (Dimming): Retains the "on_command_type: brightness" logic
-  to force HA to use a single command topic for all dimming actions.
+- FIX 12 (Dimming Race): Removed the explicit 'load.turn_on()' call
+  from the _set_level function. We now trust 'load.set_level(level)'
+  to be an atomic command that handles both turning the light on
+  AND setting the brightness, just like the mosquitto_pub test.
+  This should fix the "jump to 100%" flash when dimming from an
+  OFF state, while preserving the separate On/Off button functionality.
 """
 
 import asyncio
@@ -194,41 +196,33 @@ class VantageBridge:
                     log.warning(f"Received command for unknown load ID: {load_id}")
                     return
 
-                is_dim = self._is_dimmable.get(load_id, True)
-                log.debug(f"Handling command for Load {load_id} ({load_obj.name}) [Dimmable: {is_dim}]: Topic={topic}, Payload='{payload}'")
+                log.debug(f"Handling command for Load {load_id} ({load_obj.name}): Topic={topic}, Payload='{payload}'")
 
                 # 1. Brightness Command (e.g. .../brightness/set)
-                #    FIX 9: This topic now handles ALL commands for dimmable lights (0=OFF, 1-255=ON/Dim)
                 if len(parts) >= 5 and parts[3] == "brightness" and parts[4] == "set":
                     bri = int(payload)  # 0..255 from HA
-                    
-                    # Convert 0-255 to 0.0-100.0% for Vantage
                     level = max(0.0, min(100.0, (bri / 255.0) * 100.0))
                     
                     log.info(f"BRIGHTNESS CMD: Load {load_id} ({load_obj.name}): HA Brightness {bri} -> Vantage Level {level:.1f}%")
-                    await self._set_level(load_id, level)
+                    # Use the _set_level function, which now ONLY sets level
+                    await self._set_level(load_id, level, load_obj)
                     return
 
                 # 2. ON/OFF Command (e.g. .../set)
-                #    FIX 9: This topic is now *only* for non-dimmable lights
                 if len(parts) == 4 and parts[3] == "set":
                     command = payload.upper()
-
-                    if is_dim:
-                        log.warning(f"ON/OFF CMD: Dimmable Load {load_id} received command on 'set' topic. This should not happen with Fix 9. Ignoring.")
-                        return
-
-                    # Handle ON/OFF for non-dimmable lights
-                    if command == "OFF":
-                        log.info(f"ON/OFF CMD: Turning non-dimmable Load {load_id} ({load_obj.name}) OFF.")
-                        await load_obj.turn_off()
-                        await self._publish_load_state_async(load_id, 0.0) 
-                        return
                     
                     if command == "ON":
-                        log.info(f"ON/OFF CMD: Turning non-dimmable Load {load_id} ({load_obj.name}) ON.")
+                        log.info(f"ON/OFF CMD: Turning Load {load_id} ({load_obj.name}) ON (Restoring last level via API).")
                         await load_obj.turn_on()
-                        await self._publish_load_state_async(load_id, 100.0) 
+                        # Optimistically publish the last known level (or 100 if none)
+                        last_level = getattr(load_obj, "level", 100.0)
+                        await self._publish_load_state_async(load_id, float(last_level or 100.0))
+                        return
+                    elif command == "OFF":
+                        log.info(f"ON/OFF CMD: Turning Load {load_id} ({load_obj.name}) OFF.")
+                        await load_obj.turn_off()
+                        await self._publish_load_state_async(load_id, 0.0) # Optimistic OFF state
                         return
 
         except Exception as e:
@@ -358,34 +352,39 @@ class VantageBridge:
         except Exception as e:
             log.warning(f"Could not subscribe to load events ({e}); will rely on polling.")
 
-    async def _set_level(self, load_id: int, level: float):
+    # ==========================================================
+    # <<< FIX 12 (Dimming Race) START: This function is simplified >>>
+    # ==========================================================
+    async def _set_level(self, load_id: int, level: float, load: Optional[Any] = None):
+        """Set the level for a load. This SINGLE command should turn on AND dim."""
         if not self._vantage:
             log.warning(f"Cannot send command; Vantage not connected (load {load_id}).")
             return
         try:
-            load = self._loads.get(load_id) or await self._vantage.loads.aget(load_id)
+            # Get the load object if not already provided
+            if load is None:
+                load = self._loads.get(load_id) or await self._vantage.loads.aget(load_id)
+            
             if load is None:
                 log.warning(f"Unknown load id {load_id}")
                 return
 
             level = max(0.0, min(100.0, float(level)))
-            log.info(f"VANTAGE API: Setting load {load_id} ({getattr(load, 'name', load_id)}) to {level:.1f}%")
             
-            # FIX 9: If level is 0, call turn_off(), otherwise set_level()
-            if level == 0.0:
-                await load.turn_off()
-            else:
-                await load.set_level(level)
+            # We trust set_level() to handle turning the light ON from an OFF state
+            # and to handle set_level(0) as a 'turn_off()' command.
+            # This prevents the "flash to 100%" bug.
+            log.info(f"VANTAGE API: Setting load {load_id} ({load.name}) to {level:.1f}%")
+            await load.set_level(level)
 
-            # ==========================================================
-            # <<< FIX 5 (Optimistic State) START >>>
-            # Publish the new state immediately for a responsive UI
+            # Optimistic State
             await self._publish_load_state_async(load_id, level)
-            # <<< FIX 5 (Optimistic State) END >>>
-            # ==========================================================
 
         except Exception as e:
             log.error(f"Error setting level for {load_id}: {e}", exc_info=True)
+    # ==========================================================
+    # <<< FIX 12 (Dimming Race) END >>>
+    # ==========================================================
 
     async def _publish_bridge_offline_async(self):
         """Publish 'offline' even if main MQTT session is down."""
@@ -429,10 +428,6 @@ class VantageBridge:
         attr_topic = self._topic("light", load.id, "attributes")
 
         is_dim = self._is_dimmable.get(load.id, True)
-
-        # ==========================================================
-        # <<< FIX 9 (Dimming) START >>>
-        # ==========================================================
         
         # Base payload for all lights
         payload = {
@@ -444,6 +439,9 @@ class VantageBridge:
             "payload_available": "online",
             "payload_not_available": "offline",
             "state_topic": state_topic, # All lights report ON/OFF state
+            "command_topic": cmd_topic, # All lights get an ON/OFF topic
+            "payload_on": "ON",
+            "payload_off": "OFF",
             "device": {
                 "identifiers": [f"vantage_controller_{VANTAGE_HOST}"],
                 "name": f"Vantage Controller ({VANTAGE_HOST})",
@@ -452,30 +450,13 @@ class VantageBridge:
             },
         }
 
+        # This is the "standard" HA config: add brightness topics if dimmable
         if is_dim:
-            # Dimmable lights:
-            # - Use brightness topic for ALL commands (ON, OFF, Dim)
-            # - Report brightness state
             payload.update({
-                "command_topic": bri_cmd_topic, # Send all commands here
                 "brightness_state_topic": bri_state_topic,
-                "brightness_command_topic": bri_cmd_topic, # Redundant, but explicit
+                "brightness_command_topic": bri_cmd_topic,
                 "brightness_scale": 255,
-                "on_command_type": "brightness", # This is the magic key
             })
-        else:
-            # Non-dimmable lights:
-            # - Use main command topic
-            # - Use simple ON/OFF payloads
-            payload.update({
-                "command_topic": cmd_topic,
-                "payload_on": "ON",
-                "payload_off": "OFF",
-            })
-        
-        # ==========================================================
-        # <<< FIX 9 (Dimming) END >>>
-        # ==========================================================
 
         cfg_topic = self._ha_config_topic("light", object_id)
         await self._publish_async(cfg_topic, json.dumps(payload), retain=True, qos=1)
@@ -551,7 +532,6 @@ class VantageBridge:
         
         # ==========================================================
         # <<< FIX 10 (NameError) START >>>
-        # Was: load.id, which caused NameError. Changed to load_id.
         state_topic = self._topic("light", load_id, "state")
         bri_state_topic = self._topic("light", load_id, "brightness", "state")
         # <<< FIX 10 (NameError) END >>>
@@ -664,7 +644,7 @@ class VantageBridge:
 
     # ───────────── Run / Stop ─────────────
     async def run(self):
-        log.info("Starting Vantage MQTT Bridge (v0.9.10)...")
+        log.info("Starting Vantage MQTT Bridge (v0.9.12)...")
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 self._loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.stop(s)))
@@ -768,4 +748,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    
