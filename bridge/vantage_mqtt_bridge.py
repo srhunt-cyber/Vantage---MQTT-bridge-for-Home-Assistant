@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """
 Vantage <-> MQTT bridge
-Version 0.9.13 (Adds HA Area Support)
+Version 0.9.14 (Fix for Brightness 'OFF' Crash)
 
-- REFACTOR: Added _get_area_name_for_load() helper function to centralize
-  area name logic from the attributes function.
-- NEW: Added _publish_bridge_device_async() to register the main
-  controller/bridge as its own device.
-- FIX 13 (Areas): Updated _publish_discovery_for_load_async to create a
-  *unique device* for each Vantage load.
-- FIX 13 (Areas): This new device payload now includes 'suggested_area',
-  which makes Home Assistant automatically group the lights by their
-  Vantage area name, solving the "fixture_5" naming problem.
-- RETAINS FIX 12: The dimming logic remains the correct, simplified
-  _set_level() call.
+- FIX 14 (ValueError): Added a try...except block to the brightness
+  command handler. Home Assistant can sometimes send a text "OFF"
+  payload to the brightness/set topic, which was causing an
+  unhandled ValueError. The handler now catches this, interprets
+  "OFF" as level 0, and continues, preventing the script from
+  crashing.
 """
 
 import asyncio
@@ -188,6 +183,9 @@ class VantageBridge:
             except Exception as e:
                 log.error(f"MQTT publish error on {topic}: {e}")
 
+    # ==========================================================
+    # <<< FIX 14 (ValueError) START: Updated this function >>>
+    # ==========================================================
     async def _handle_mqtt_message_async(self, message: Message):
         topic = str(message.topic)
         payload = message.payload.decode("utf-8", "ignore").strip()
@@ -206,10 +204,27 @@ class VantageBridge:
 
                 # 1. Brightness Command (e.g. .../brightness/set)
                 if len(parts) >= 5 and parts[3] == "brightness" and parts[4] == "set":
-                    bri = int(payload)  # 0..255 from HA
-                    level = max(0.0, min(100.0, (bri / 255.0) * 100.0))
+                    level = 0.0 # Default to 0
+                    try:
+                        # First, try to parse it as a number (0-255)
+                        bri = int(payload)
+                        level = max(0.0, min(100.0, (bri / 255.0) * 100.0))
+                        log.info(f"BRIGHTNESS CMD: Load {load_id} ({load_obj.name}): HA Brightness {bri} -> Vantage Level {level:.1f}%")
                     
-                    log.info(f"BRIGHTNESS CMD: Load {load_id} ({load_obj.name}): HA Brightness {bri} -> Vantage Level {level:.1f}%")
+                    except ValueError:
+                        # If it's not a number, it's probably "ON" or "OFF"
+                        command = payload.upper()
+                        if command == "OFF":
+                            log.info(f"BRIGHTNESS CMD (OFF): Load {load_id} ({load_obj.name}) received 'OFF'. Setting level 0.0%")
+                            level = 0.0
+                        elif command == "ON":
+                            # This might happen if 'on_command_type' is 'brightness'
+                            log.info(f"BRIGHTNESS CMD (ON): Load {load_id} ({load_obj.name}) received 'ON'. Restoring level.")
+                            level = float(load_obj.level or 100.0)
+                        else:
+                            log.warning(f"BRIGHTNESS CMD (INVALID): Load {load_id} received invalid payload: '{payload}'. Ignoring.")
+                            return
+
                     await self._set_level(load_id, level, load_obj)
                     return
 
@@ -220,7 +235,6 @@ class VantageBridge:
                     if command == "ON":
                         log.info(f"ON/OFF CMD: Turning Load {load_id} ({load_obj.name}) ON (Restoring last level via API).")
                         await load_obj.turn_on()
-                        # Optimistically publish the last known level (or 100 if none)
                         last_level = getattr(load_obj, "level", 100.0)
                         await self._publish_load_state_async(load_id, float(last_level or 100.0))
                         return
@@ -231,13 +245,15 @@ class VantageBridge:
                         return
 
         except Exception as e:
+            # This is the outer try/except that catches the error
             log.error(f"Error parsing MQTT cmd {topic}='{payload}': {e}", exc_info=True)
+    # ==========================================================
+    # <<< FIX 14 (ValueError) END >>>
+    # ==========================================================
+
 
     # ───────────── Vantage ─────────────
 
-    # ==========================================================
-    # <<< REFACTOR: New Helper Function >>>
-    # ==========================================================
     def _get_area_name_for_load(self, load: Any) -> str:
         """Helper to find the area name for a given load object."""
         area_name: Optional[str] = None
@@ -343,9 +359,6 @@ class VantageBridge:
 
         log.info(f"Load discovery and naming complete ({len(self._loads)} loads).")
 
-        # ==========================================================
-        # <<< NEW: Register the bridge/controller as a "device" >>>
-        # ==========================================================
         await self._publish_bridge_device_async()
 
         # Step 3: Publish discovery, attributes, and initial state
@@ -437,9 +450,6 @@ class VantageBridge:
 
     # ───────────── HA Discovery & State ─────────────
 
-    # ==========================================================
-    # <<< NEW: Function to publish the bridge device itself >>>
-    # ==========================================================
     async def _publish_bridge_device_async(self):
         """Publishes the main bridge device config to HA."""
         try:
@@ -450,7 +460,7 @@ class VantageBridge:
                 "name": f"Vantage Controller ({VANTAGE_HOST})",
                 "manufacturer": "Vantage",
                 "model": "InFusion (SDK) Bridge",
-                "sw_version": "0.9.13",
+                "sw_version": "0.9.14", # Updated version
             }
             await self._publish_async(topic, json.dumps(payload), retain=True, qos=1)
             log.info("Published main bridge device to Home Assistant.")
@@ -485,14 +495,7 @@ class VantageBridge:
 
         is_dim = self._is_dimmable.get(load.id, True)
         
-        # ==========================================================
-        # <<< FIX 13 (Areas) START: New Device Payload >>>
-        # ==========================================================
-        
-        # Get the area name for this load
         area_name = self._get_area_name_for_load(load)
-
-        # This is the unique identifier for the *device* this entity belongs to
         load_device_id = f"vantage_{VANTAGE_HOST}_load_{load.id}"
 
         payload = {
@@ -508,7 +511,6 @@ class VantageBridge:
             "payload_on": "ON",
             "payload_off": "OFF",
             
-            # This is the new device payload
             "device": {
                 "identifiers": [load_device_id], # Unique ID for this *device*
                 "name": friendly_name, # The device name, e.g., "Living Room Fixture"
@@ -518,9 +520,6 @@ class VantageBridge:
                 "via_device": BRIDGE_DEVICE_ID, # Links this device to the main bridge device
             },
         }
-        # ==========================================================
-        # <<< FIX 13 (Areas) END >>>
-        # ==========================================================
 
         if is_dim:
             payload.update({
@@ -535,20 +534,14 @@ class VantageBridge:
     async def _publish_attributes_for_load_async(self, load: Any):
         """Publish the Area Name and other metadata as retained attributes."""
         load_name = getattr(load, "name", "load")
-        
-        # ==========================================================
-        # <<< REFACTOR: Use the new helper function >>>
-        # ==========================================================
         area_name = self._get_area_name_for_load(load)
         
-        # Define the attributes payload
         attributes = {
             "vantage_area": area_name, # Still useful for display
             "vantage_id": load.id,
             "vantage_name": load_name,
         }
 
-        # Publish to the attributes topic
         attr_topic = self._topic("light", load.id, "attributes")
         await self._publish_async(attr_topic, json.dumps(attributes), retain=True, qos=1)
 
@@ -651,7 +644,7 @@ class VantageBridge:
 
     # ───────────── Run / Stop ─────────────
     async def run(self):
-        log.info(f"Starting Vantage MQTT Bridge (v{0.9.13})...")
+        log.info(f"Starting Vantage MQTT Bridge (v0.9.14)...")
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 self._loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.stop(s)))
@@ -745,3 +738,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+      
