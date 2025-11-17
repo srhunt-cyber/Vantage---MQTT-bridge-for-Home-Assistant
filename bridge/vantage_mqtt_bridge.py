@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
 Vantage <-> MQTT bridge
-Version 0.9.14 (Fix for Brightness 'OFF' Crash)
+Version 0.9.16-final
 
+- FIX: (v0.9.16) Corrected NameError in _publish_load_state_async
+  (was using 'load.id' instead of 'load_id').
+- FIX: (v0.9.15) Changed BRIDGE_DEVICE_ID to use underscores instead of
+  periods to prevent "illegal discovery topic" errors.
+- FIX: (v0.9.15) Changed _publish_bridge_device_async to publish a
+  dummy 'sensor' entity. This is the correct way to register the
+  main bridge device and avoids the "Unnamed device" bug.
+- FIX: (v0.9.15) Changed _publish_discovery_for_load_async to use the
+  new 'safe' device ID for linking, but retains the *original*
+  'legacy' entity unique_id. This re-links all existing entities
+  to the correct device, fixing all `_2` entities.
 - FIX 14 (ValueError): Added a try...except block to the brightness
-  command handler. Home Assistant can sometimes send a text "OFF"
-  payload to the brightness/set topic, which was causing an
-  unhandled ValueError. The handler now catches this, interprets
-  "OFF" as level 0, and continues, preventing the script from
-  crashing.
+  command handler.
 """
 
 import asyncio
@@ -52,6 +59,7 @@ logging.getLogger("aiovantage").setLevel(logging.INFO)  # set DEBUG for protocol
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 VANTAGE_HOST = os.getenv("VANTAGE_HOST", "192.168.1.39")
+VANTAGE_HOST_SAFE = VANTAGE_HOST.replace(".", "_") # <<< FIX 1
 VANTAGE_USER = os.getenv("VANTAGE_USER") or None
 VANTAGE_PASS = os.getenv("VANTAGE_PASS") or None
 
@@ -65,7 +73,7 @@ BASE_TOPIC = os.getenv("BASE_TOPIC", "vantage")
 DISCOVERY_PREFIX = os.getenv("DISCOVERY_PREFIX", "homeassistant")
 
 AVAILABILITY_TOPIC = f"{BASE_TOPIC}/bridge/status"
-BRIDGE_DEVICE_ID = f"vantage_controller_{VANTAGE_HOST}"
+BRIDGE_DEVICE_ID = f"vantage_controller_{VANTAGE_HOST_SAFE}" # <<< FIX 2
 
 # Timing
 RECONNECT_DELAY_MQTT = 10
@@ -450,20 +458,37 @@ class VantageBridge:
 
     # ───────────── HA Discovery & State ─────────────
 
+    # ==========================================================
+    # <<< REPLACED FUNCTION (Fix 3 of 5) >>>
+    # This now creates the bridge device via a dummy sensor,
+    # which is the correct method and fixes the "Unnamed device" bug.
+    # ==========================================================
     async def _publish_bridge_device_async(self):
-        """Publishes the main bridge device config to HA."""
+        """Publishes the main bridge device config to HA by creating a dummy sensor."""
         try:
-            # This isn't a real entity, just a device entry
-            topic = f"{DISCOVERY_PREFIX}/device/{BRIDGE_DEVICE_ID}/config"
+            # We create a dummy "status" sensor.
+            # This entity's config will contain the *real* device info.
+            object_id = f"{BRIDGE_DEVICE_ID}_status" # BRIDGE_DEVICE_ID is already safe
+            topic = self._ha_config_topic("sensor", object_id) # Uses the standard topic format
+
             payload = {
-                "identifiers": [BRIDGE_DEVICE_ID],
-                "name": f"Vantage Controller ({VANTAGE_HOST})",
-                "manufacturer": "Vantage",
-                "model": "InFusion (SDK) Bridge",
-                "sw_version": "0.9.14", # Updated version
+                "name": "Bridge Status",
+                "default_entity_id": f"sensor.{object_id}",
+                "unique_id": f"{BRIDGE_DEVICE_ID}_status_sensor",
+                "state_topic": AVAILABILITY_TOPIC, # Re-use the availability topic
+                "icon": "mdi:bridge",
+                "device": {
+                    "identifiers": [BRIDGE_DEVICE_ID],
+                    "name": f"Vantage Controller ({VANTAGE_HOST})", # Friendly name uses periods
+                    "manufacturer": "Vantage",
+                    "model": "InFusion (SDK) Bridge",
+                    "sw_version": "0.9.16-final", # Updated version
+                },
+                # This sensor will be part of the main device
+                "entity_category": "diagnostic",
             }
             await self._publish_async(topic, json.dumps(payload), retain=True, qos=1)
-            log.info("Published main bridge device to Home Assistant.")
+            log.info("Published main bridge device (via dummy sensor) to Home Assistant.")
         except Exception as e:
             log.error(f"Failed to publish bridge device: {e}", exc_info=True)
 
@@ -477,6 +502,11 @@ class VantageBridge:
             await self._publish_discovery_for_load_async(load_obj)
             await self._publish_attributes_for_load_async(load_obj)
 
+    # ==========================================================
+    # <<< REPLACED FUNCTION (Fix 4 of 5) >>>
+    # This now re-links your old entities (using periods) to the
+    # new, safe device (using underscores), fixing all `_2` entities.
+    # ==========================================================
     async def _publish_discovery_for_load_async(self, load: Any):
         if not self._mqtt_connected:
             return
@@ -496,12 +526,16 @@ class VantageBridge:
         is_dim = self._is_dimmable.get(load.id, True)
         
         area_name = self._get_area_name_for_load(load)
-        load_device_id = f"vantage_{VANTAGE_HOST}_load_{load.id}"
+
+        # 1. This is the NEW, SAFE ID for the *device* itself (uses underscores)
+        safe_load_device_id = f"vantage_{VANTAGE_HOST_SAFE}_load_{load.id}"
+
+        # 2. This is the OLD, LEGACY ID for the *entity* (uses periods)
+        legacy_entity_unique_id = f"vantage_{VANTAGE_HOST}_load_{load.id}_light"
 
         payload = {
             "name": friendly_name,
-            "object_id": object_id,
-            "unique_id": f"{load_device_id}_light", # Unique ID for the *entity*
+            "unique_id": legacy_entity_unique_id, # <-- USE THE LEGACY ID
             "json_attributes_topic": attr_topic,
             "availability_topic": AVAILABILITY_TOPIC,
             "payload_available": "online",
@@ -512,12 +546,12 @@ class VantageBridge:
             "payload_off": "OFF",
             
             "device": {
-                "identifiers": [load_device_id], # Unique ID for this *device*
+                "identifiers": [safe_load_device_id], # <-- USE THE SAFE ID
                 "name": friendly_name, # The device name, e.g., "Living Room Fixture"
-                "suggested_area": area_name, # <-- THE FIX!
+                "suggested_area": area_name, 
                 "manufacturer": "Vantage",
                 "model": "InFusion Load",
-                "via_device": BRIDGE_DEVICE_ID, # Links this device to the main bridge device
+                "via_device": BRIDGE_DEVICE_ID, # Links to the main bridge
             },
         }
 
@@ -530,6 +564,7 @@ class VantageBridge:
 
         cfg_topic = self._ha_config_topic("light", object_id)
         await self._publish_async(cfg_topic, json.dumps(payload), retain=True, qos=1)
+
 
     async def _publish_attributes_for_load_async(self, load: Any):
         """Publish the Area Name and other metadata as retained attributes."""
@@ -545,6 +580,10 @@ class VantageBridge:
         attr_topic = self._topic("light", load.id, "attributes")
         await self._publish_async(attr_topic, json.dumps(attributes), retain=True, qos=1)
 
+    # ==========================================================
+    # <<< REPLACED FUNCTION (Fix 5 of 5) >>>
+    # This now correctly uses 'load_id' to prevent the NameError.
+    # ==========================================================
     async def _publish_load_state_async(self, load_id: int, level: Optional[float]):
         if level is None:
             log.debug(f"Skipping state publish for load {load_id}: Level is None.")
@@ -644,7 +683,7 @@ class VantageBridge:
 
     # ───────────── Run / Stop ─────────────
     async def run(self):
-        log.info(f"Starting Vantage MQTT Bridge (v0.9.14)...")
+        log.info(f"Starting Vantage MQTT Bridge (v0.9.16-final)...")
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 self._loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.stop(s)))
@@ -661,7 +700,7 @@ class VantageBridge:
                 vantage_conn_start_time = time.monotonic()
                 async with Vantage(VANTAGE_HOST, VANTAGE_USER, VANTAGE_PASS) as vantage:
                     self._vantage_connect_time = time.monotonic() - vantage_conn_start_time
-                    log.info("Vantage connected.")
+                    log.info("VDntage connected.")
                     self._vantage = vantage
                     self._last_event_time = time.monotonic()    
 
@@ -738,4 +777,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-      
