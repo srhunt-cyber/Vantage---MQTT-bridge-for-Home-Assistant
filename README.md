@@ -21,24 +21,30 @@ This bridge is for those who:
 
 ## 🚀 Key Features
 
-### 1. "Sniper Polling" (The Log Tap)
-Legacy Vantage controllers often do not broadcast status updates when a keypad scene (Task) is executed. They stay silent until polled.
-* **The Old Way:** Poll every 5 seconds (floods the network, creates lag).
-* **The Sniper Way:** This bridge attaches a silent "Tap" to the library's debug stream. It watches for `EL: Keypad Button Press` lines. When a button is pressed, it wakes up, waits a configurable time (default 5s) for the fade to finish, and *then* polls for updates.
-* **Result:** Instant-feeling updates in Home Assistant without constant network traffic.
+## ✨ Key Features
 
-### 2. Serial Throttling (Buffer Protection)
-Modern Home Assistant systems can fire MQTT commands (e.g., "Turn off entire floor") in milliseconds. Legacy Vantage serial buffers can often only handle ~3-4 commands per second before overflowing and dropping packets.
-* **The Fix:** This bridge implements a configurable micro-throttle (Default: 20ms) between outgoing commands.
-* **Result:** You can ask Alexa to "Turn off the House" and the bridge will queue and feed the commands reliably without crashing the controller.
+### 1. Instant Load Discovery (Zero Config)
+On startup, the bridge immediately queries your Vantage controller and discovers every light, switch, and relay.
+* **Auto-Naming:** Uses your existing Vantage names (e.g., "Kitchen Overhead").
+* **Auto-Area:** Reads the "Area" (Room) from Vantage and automatically assigns the device to that room in Home Assistant.
+* **Result:** You start the bridge, and seconds later, your entire house is populated in Home Assistant. No YAML required.
 
-### 3. Automatic Area Assignment
-Automatically detects the Area/Room for each light from your Vantage config and assigns it in Home Assistant using the `suggested_area` feature. This makes organizing systems with 100+ lights significantly easier.
+### 2. "Lazy Discovery" for Buttons (The Log Tap)
+Most integrations struggle to see Keypad Button presses because the controller doesn't broadcast them like it does for lights.
+* **The Magic:** This bridge watches the debug logs in the background. When you physically press a button on a wall keypad, the bridge intercepts the event.
+* **The Action:** If it hasn't seen that button before, it **automatically creates a Device Trigger**.
+* **The Result:** To automate a scene button, just walk up to it, press it once, and it appears in Home Assistant ready for use.
 
-### 4. Standalone Service & Monitoring
-Runs as a separate `systemd` service for high reliability. Publishes its own health (uptime, CPU, memory) and connection status to MQTT for monitoring in HA.
+### 3. "Sniper Polling" (State Accuracy)
+Legacy Vantage controllers are often "Scene Blind"—they execute macros but don't tell Home Assistant the result.
+* **The Old Way:** Poll every 5 seconds (floods the network, causes lag).
+* **The Sniper Way:** The bridge detects that button press instantly, waits a configurable time (default 5s) for the fade to finish, and *then* polls exactly once.
+* **Result:** Your app stays perfectly in sync without bogging down the network.
 
----
+### 4. Serial Throttling (Crash Protection)
+Modern Home Assistant systems can fire MQTT commands in milliseconds. Legacy Vantage serial buffers can often only handle ~3-4 commands per second before overflowing.
+* **The Fix:** A configurable micro-throttle (Default: 20ms) manages the queue.
+* **Result:** You can ask Alexa to "Turn off the House" (50+ lights) and the bridge will feed them to the controller safely, one by one, without a crash.
 
 ## Prerequisites
 
