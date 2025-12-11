@@ -1,0 +1,18 @@
+# --- Security (Crucial) ---
+.env
+.env.local
+
+# --- Python Junk ---
+__pycache__/
+*.py[cod]
+.venv/
+env/
+venv/
+
+# --- OS Junk ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+*.bak
