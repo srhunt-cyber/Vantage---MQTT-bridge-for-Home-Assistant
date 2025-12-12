@@ -4,56 +4,47 @@
 
 A standalone, high-reliability Python bridge that connects **Legrand Vantage InFusion** lighting controllers to **Home Assistant** via **MQTT**.
 
-Built to be stable under real-world “house-wide” automations and to keep state accurate even when the Vantage system executes scenes/macros that don’t broadcast cleanly.
+Designed for stability in real homes: controller-safe command pacing, reliable state sync after scenes/fades, and “lazy discovery” of keypad presses via the controller event log stream.
 
 ---
 
-## Why this bridge?
+## What this bridge solves
 
-This project is an alternative to the standard Home Assistant Vantage integration. It runs as a **separate service** (decoupled from HA) and acts as a “traffic cop” for legacy Vantage hardware.
+This project runs as a **separate service** (decoupled from Home Assistant) and is engineered for three common reliability problems:
 
-It is engineered for three common reliability problems:
+1. **Restart resilience**  
+   Home Assistant restarts shouldn’t destabilize a legacy controller connection.
 
-1. **The restart problem**  
-   Restarting Home Assistant can drop the controller connection. On some older controllers this can lead to lockups requiring a reboot.
-
-2. **Command-flood crashes**  
-   Legacy controllers may choke when Home Assistant sends many commands at once (for example, “Turn off house”).
+2. **Command-flood protection**  
+   Legacy controllers can choke when many commands arrive at once (e.g., “Turn off house”).
 
 3. **Scene blindness / stale state**  
-   Some controllers execute keypad macros/scenes but don’t reliably broadcast the resulting state changes.
+   Some controllers execute keypad macros/scenes but don’t reliably broadcast resulting load state changes.
 
 ---
 
 ## Key features
 
 ### 1) Instant load discovery (zero config)
-
-On startup, the bridge queries the controller and discovers lights/switches/relays:
-
-- Uses existing Vantage names
+On startup, the bridge queries the controller and discovers loads:
+- Uses existing Vantage load names
 - Assigns devices to the Vantage “Area” (room) in Home Assistant
-- Populates HA entities via MQTT discovery
+- Publishes entities via MQTT discovery
 
 ### 2) “Lazy discovery” for keypad buttons (Log Tap)
+Some systems don’t expose keypad button presses cleanly.  
+This bridge watches the controller’s **event log** stream and auto-creates triggers the first time you press a keypad button.
 
-Many systems don’t expose keypad button presses cleanly.  
-This bridge watches the controller event log stream and **auto-creates** triggers the first time you press a keypad button.
-
-**Result:** Walk up to a keypad, press a button once, and it appears in Home Assistant ready for automations.
+**Workflow:** start the bridge → press the buttons you care about once → build HA automations.
 
 ### 3) “Sniper polling” (state accuracy without spam)
-
-Instead of polling constantly:
-
-- Detect a physical interaction
-- Wait for fades/macros to complete (configurable)
+Instead of constant polling:
+- Detect a physical interaction (keypad press)
+- Wait for fades/macros to complete
 - Poll once to sync state
 
 ### 4) Serial throttling (crash protection)
-
-Home Assistant can fire MQTT commands extremely fast; some controllers can’t.  
-A micro-throttle feeds commands safely to avoid controller overflow.
+Adds micro-delays between outgoing commands to prevent controller buffer overflows.
 
 ---
 
@@ -61,7 +52,7 @@ A micro-throttle feeds commands safely to avoid controller overflow.
 
 - Python 3.10+ (3.11+ recommended)
 - MQTT broker (e.g., Mosquitto)
-- Network access to your Vantage controller (InFusion)
+- IP reachability from this service to your Vantage controller (InFusion)
 
 ---
 
@@ -79,8 +70,6 @@ pip install -r requirements.txt
 ```
 
 ### 2) Configure
-
-Copy the template and edit your settings:
 
 ```bash
 cp .env.example .env
@@ -127,46 +116,75 @@ sudo systemctl enable --now vantage-bridge.service
 sudo systemctl status vantage-bridge.service
 ```
 
-Tips:
-
-- Use an absolute path for `WorkingDirectory`, `.env`, and the Python interpreter.
-- If you run into permissions issues, ensure `User=...` owns the repo folder (or use `Group=`).
-
 ---
 
-## Configuration (.env)
+## Configuration reference (.env)
 
-See `.env.example` for the full list. The main timing knobs:
+### Required
+| Setting | Example | Description |
+|---|---|---|
+| `VANTAGE_HOST` | `192.168.1.50` | IP/hostname of the Vantage controller |
 
-| Setting | Default | What it does |
+### Optional (controller)
+| Setting | Default | Description |
 |---|---:|---|
-| `POLL_INTERVAL` | `90` | “Safety heartbeat” full check when the house is quiet |
-| `POLL_QUIET_TIME` | `5` | Wait time after interaction before polling (set to your longest fade + ~1s) |
-| `COMMAND_THROTTLE_DELAY` | `0.02` | Delay (seconds) between outgoing commands to prevent overflow |
+| `VANTAGE_USER` | *(empty)* | Username (if required) |
+| `VANTAGE_PASS` | *(empty)* | Password (if required) |
 
-Suggested starting points:
+### Optional (MQTT)
+| Setting | Default | Description |
+|---|---:|---|
+| `MQTT_HOST` | `127.0.0.1` | MQTT broker host |
+| `MQTT_PORT` | `1883` | MQTT broker port |
+| `MQTT_USERNAME` | *(empty)* | Broker username |
+| `MQTT_PASSWORD` | *(empty)* | Broker password |
+| `MQTT_TLS_ENABLED` | `false` | Enables TLS (basic toggle; see Notes) |
+| `BASE_TOPIC` | `vantage` | Root topic for bridge topics |
+| `DISCOVERY_PREFIX` | `homeassistant` | HA MQTT discovery prefix |
 
-- If you have long fades/macros: increase `POLL_QUIET_TIME` (e.g., 6–10 seconds).
-- If you ever see missed commands: slightly increase `COMMAND_THROTTLE_DELAY` (e.g., 0.03–0.06).
-- If your system is very stable and quiet: increase `POLL_INTERVAL` to reduce chatter (e.g., 120–180).
+### Tuning knobs (Sniper behavior)
+| Setting | Default | Description |
+|---|---:|---|
+| `POLL_INTERVAL` | `90` | Safety-net: force a full status check periodically |
+| `POLL_QUIET_TIME` | `5` | Don’t poll if recent activity occurred (usually fade time + ~1s) |
+| `COMMAND_THROTTLE_DELAY` | `0.02` | Delay between outgoing commands to protect serial buffers |
+
+### Debug
+| Setting | Default | Description |
+|---|---:|---|
+| `LOG_LEVEL` | `INFO` | Bridge log level |
+| `PUBLISH_RAW_BUTTON_EVENTS` | `false` | Publishes raw JSON for every detected keypad event |
+
+**Notes**
+- TLS is currently a simple “on/off” toggle. If your broker requires CA/cert configuration, you may need to extend TLS settings in code.
 
 ---
 
 ## How keypad “Lazy Discovery” works (Log Tap)
 
-Some InFusion setups don’t provide a clean way to subscribe to keypad button actions.  
-This bridge listens to the controller’s event log stream and extracts keypad press events.
+The bridge attaches a custom `logging.Handler` to the `aiovantage` debug stream and parses `EL:` event log lines to detect:
+- keypad button state changes
+- task running state changes (virtual tasks)
 
-When a button is observed for the first time, the bridge:
+On first sight of a button/task action, it publishes HA MQTT device trigger discovery and then publishes subsequent actions to MQTT.
 
-- creates a corresponding MQTT-discovered entity/trigger in Home Assistant
-- publishes future presses/releases for automations
+---
 
-Practical workflow:
+## Dimming and ON/OFF semantics (important)
 
-1. Start the bridge
-2. Press each keypad button you care about once
-3. Build HA automations using the created button events
+Home Assistant commonly sends:
+- `.../set` with `ON` / `OFF`
+- `.../brightness/set` with a value `0–255`
+
+Bridge behavior:
+- `brightness/set` with **0–255** sets the Vantage level proportionally.
+- `brightness/set` with payload **`ON`** is treated as “restore last non-zero” level (per-load).
+- `set` with **`ON`** restores last non-zero (default 100% if unknown).
+- `set` with **`OFF`** turns off and publishes state immediately.
+
+The bridge publishes:
+- `.../state` as `ON` / `OFF`
+- `.../brightness/state` as `0–255` for dimmable loads
 
 ---
 
@@ -175,8 +193,6 @@ Practical workflow:
 Because “Lazy Discovery” exposes keypad presses as triggers, you can build higher-level behaviors.
 
 ### Recipe 1: “Double-tap fixer” (resync a zombie light)
-
-If a light ever gets out of sync, double-tap the wall button to force a resync.
 
 ```yaml
 alias: Vantage - Double Tap Resync Light
@@ -209,8 +225,6 @@ action:
 
 ### Recipe 2: “Smart exit switch”
 
-Use a door button to turn ON when entering, but turn OFF multiple lights if leaving.
-
 ```yaml
 alias: Vantage - Smart Exit Switch
 mode: restart
@@ -238,112 +252,80 @@ action:
 
 ---
 
-## Seamless migration (safe for dashboards)
+## MQTT topics
 
-This bridge is intended to be a drop-in replacement for existing naming in many setups.
+### Loads (lights)
+- State: `BASE_TOPIC/light/<id>/state` → `ON` / `OFF`
+- Command: `BASE_TOPIC/light/<id>/set` → `ON` / `OFF`
+- Brightness state: `BASE_TOPIC/light/<id>/brightness/state` → `0–255`
+- Brightness command: `BASE_TOPIC/light/<id>/brightness/set` → `0–255` (or `ON`)
 
-Migration steps:
+### Keypads / tasks
+- Action topic: `BASE_TOPIC/keypad/<station_or_task>/button/<pos>/action` → `press` / `release`
+- Raw debug (optional): `BASE_TOPIC/keypad/_raw` → JSON
 
-1. Stop/disable the old integration (if applicable)
-2. Start this bridge
-3. In Home Assistant: **Settings → Devices & services → MQTT → Reload**
+### Bridge status
+- Availability: `BASE_TOPIC/bridge/status` → `online` / `offline`
 
-If you previously had entities with the same names:
-
-- you may want to remove old entities first to avoid duplicates
-- or change your MQTT discovery “prefix” (if your bridge supports it) during migration
-
----
-
-## Optional: Monitoring sensors in Home Assistant
-
-If you publish bridge diagnostics/status to MQTT, you can create HA MQTT sensors like:
-
-```yaml
-mqtt:
-  sensor:
-    - name: "Vantage Bridge Status"
-      state_topic: "vantage/bridge/status"
-
-    - name: "Vantage Bridge CPU"
-      state_topic: "vantage/diagnostics/cpu_usage_pct"
-      unit_of_measurement: "%"
-
-    - name: "Vantage Bridge Memory"
-      state_topic: "vantage/diagnostics/mem_usage_pct"
-      unit_of_measurement: "%"
-```
-
-You can put this in your HA `configuration.yaml` (or a package), then reload MQTT.
+### Diagnostics (published periodically)
+- `BASE_TOPIC/diagnostics/cpu_usage_pct`
+- `BASE_TOPIC/diagnostics/memory_usage_mb`
+- `BASE_TOPIC/diagnostics/uptime_s`
+- `BASE_TOPIC/diagnostics/messages_published_total`
+- `BASE_TOPIC/diagnostics/entity_count`
 
 ---
-
-## MQTT topic reference (examples)
-
-These are example patterns (adjust if you changed your base topic).
-
-### Loads (lights/switches)
-
-- Load On/Off state:  
-  `vantage/light/<id>/state` → `ON` / `OFF`
-
-- Load brightness state (if dimmable):  
-  `vantage/light/<id>/brightness/state` → `0–255`
-
-- Load On/Off command:  
-  `vantage/light/<id>/set` → `ON` / `OFF`
-
-- Load brightness command:  
-  `vantage/light/<id>/brightness/set` → `0–255`
-
-### Keypads
-
-- Button action:  
-  `vantage/keypad/<id>/button/<pos>/action` → `press` / `release`
-
-### Bridge / diagnostics
-
-- Bridge status:  
-  `vantage/bridge/status` → `online` / `offline`
-
-- Diagnostics metrics:  
-  `vantage/diagnostics/<metric>`  
-  Examples: `cpu_usage_pct`, `mem_usage_pct`
-
 ---
+
+## Known limitations and design choices (intentional)
+
+This bridge intentionally favors **predictability** over “clever” optimizations, because small changes in MQTT timing can cause hard-to-debug Home Assistant behavior (duplicate commands, out-of-order state updates, and perceived “flapping” between ON/OFF and brightness).
+
+### 1) Minimal command dedupe / debounce (by design)
+Home Assistant may emit multiple MQTT commands for a single UI action (for example, `set=ON` and a brightness value close together).  
+It is tempting to add aggressive dedupe/debounce, but in practice that can introduce race conditions where:
+- one command is dropped incorrectly,
+- brightness is applied without a preceding ON,
+- HA and the bridge disagree on the final state.
+
+Instead, the bridge relies on:
+- controller-safe pacing (`COMMAND_THROTTLE_DELAY`)
+- “restore last non-zero” semantics for ON
+- state publication after each applied command
+
+### 2) Keypad discovery depends on the controller event log
+“Lazy discovery” is driven by parsing `EL:` lines from the controller’s event log stream via the `aiovantage` debug logger.  
+If your controller/firmware does not emit those lines (or the stream is blocked), keypad triggers may not appear.
+
+### 3) TLS support is basic
+`MQTT_TLS_ENABLED=true` enables TLS with a minimal configuration.  
+If your broker requires custom CA certificates or mutual TLS, you may need to extend the TLS parameters in code.
+
+### 4) Entity model follows what works in HA
+Loads are published as MQTT lights (with brightness topics). Some non-dimmable loads may still appear with brightness controls depending on the controller metadata. This is intentional to avoid changing entity types mid-stream and breaking dashboards/automations.
+
 
 ## Troubleshooting
 
-### The bridge starts but I don’t see entities in HA
-
-- Confirm HA is connected to the same MQTT broker as the bridge
-- In HA: **Settings → Devices & services → MQTT** and confirm discovery is enabled
-- Check the broker for discovery topics (use `mosquitto_sub -t '#' -v` carefully)
+### I don’t see entities in Home Assistant
+- Confirm HA uses the same MQTT broker as the bridge
+- Confirm MQTT discovery is enabled in HA
+- Check broker traffic: `mosquitto_sub -t '#' -v` (careful: noisy)
 
 ### Keypads aren’t showing up
-
-- Press each keypad button once after the bridge is running (that’s the “lazy discovery” trigger)
-- Confirm your Vantage controller event log stream is accessible and enabled
-- Increase log verbosity (if supported) to see whether keypad events are being detected
+- Press each keypad button once after the bridge is running (lazy discovery)
+- Confirm your controller produces event log (`EL:`) lines (see logs)
 
 ### Commands sometimes get ignored
-
 - Increase `COMMAND_THROTTLE_DELAY` slightly (0.02 → 0.03–0.06)
-- Avoid “blast” automations that toggle dozens of loads in the same millisecond
+- Avoid automations that toggle dozens of loads at once without delays
 
 ### State gets stale after running macros/scenes
-
-- Increase `POLL_QUIET_TIME` to allow fades/macros to finish before the bridge polls
-- Ensure the bridge is actually polling after interactions (check logs)
-
----
-
-## Architectural note: “Log Tap” with aiovantage
-
-This bridge uses the `aiovantage` library but attaches a custom logging handler to intercept the controller’s event log stream in order to detect keypad presses on systems that don’t expose them cleanly.
+- Increase `POLL_QUIET_TIME` to cover long fades/macros
+- Verify fallback polling is enabled in the bridge (it is by default)
 
 ---
 
 ## Credits
 
-- `loopj` for the `aiovantage` library and related Vantage tooling
+- `loopj` for `aiovantage` and related Vantage tooling
