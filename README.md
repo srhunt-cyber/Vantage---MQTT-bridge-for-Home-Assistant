@@ -32,10 +32,23 @@ On startup, the bridge queries the controller and discovers loads:
 - Publishes entities via MQTT discovery
 
 ### 2) “Lazy discovery” for keypad buttons (Log Tap)
+
 Some systems don’t expose keypad button presses cleanly.  
 This bridge watches the controller’s **event log** stream and auto-creates triggers the first time you press a keypad button.
 
 **Workflow:** start the bridge → press the buttons you care about once → build HA automations.
+
+#### Keypads as “scene triggers” for mixed ecosystems (Vantage + low-cost smart devices)
+
+A major motivation for recognizing keypad presses/macros is that many homes have **non‑Vantage loads** in the same spaces (for example, lamps or accent lighting on TP‑Link/Kasa plugs/switches).
+
+Once keypad actions are exposed to Home Assistant, a Vantage keypad effectively becomes a **universal scene controller**:
+
+- Press a Vantage keypad button → HA automation triggers
+- HA automation updates **both** Vantage loads **and** non‑Vantage devices (Kasa/TP‑Link, Hue, etc.)
+- The room behaves like one coherent lighting scene even if some devices aren’t on the Vantage bus
+
+This lets you “fill in” lighting coverage without rewiring or adding expensive Vantage modules, while keeping the same wall keypads and user experience.
 
 ### 3) “Sniper polling” (state accuracy without spam)
 Instead of constant polling:
@@ -329,3 +342,4 @@ Loads are published as MQTT lights (with brightness topics). Some non-dimmable l
 ## Credits
 
 - `loopj` for `aiovantage` and related Vantage tooling
+
