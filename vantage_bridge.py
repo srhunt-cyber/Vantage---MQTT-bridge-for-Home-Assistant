@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Vantage InFusion <-> MQTT Bridge
-Version: 1.1.0-Sniper
+Vantage <-> MQTT bridge
+Version 1.1.1-SniperFix
 
-ARCHITECTURE: 
-  - "Log Tap": Intercepts raw data from the library's debug stream to detect button presses.
-  - "Sniper Polling": Wakes up instantly on button press, waits for fade, then polls.
-  - "Serial Throttle": Adds micro-delays between commands to prevent controller buffer overflows.
+- BASE: v1.0.9 (Safe Logging + Throttle).
+- FIX: Re-connected the "Sniper" trigger so button presses force an immediate poll.
 """
 
 import asyncio
@@ -27,12 +25,38 @@ from aiovantage import Vantage
 from dotenv import load_dotenv
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Load .env & Configuration
+# Load .env
 # ─────────────────────────────────────────────────────────────────────────────
 
 load_dotenv()
 
-# Connection Settings
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging Setup
+# ─────────────────────────────────────────────────────────────────────────────
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_requested_level = getattr(logging, LOG_LEVEL, logging.INFO)
+ROOT_LEVEL = logging.INFO if _requested_level < logging.INFO else _requested_level
+
+root_logger = logging.getLogger()
+root_logger.setLevel(ROOT_LEVEL)
+
+for h in list(root_logger.handlers):
+    root_logger.removeHandler(h)
+
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+console = logging.StreamHandler()
+console.setLevel(ROOT_LEVEL)
+console.setFormatter(formatter)
+root_logger.addHandler(console)
+
+log = logging.getLogger("vantage_mqtt_bridge")
+logging.getLogger("aiomqtt").setLevel(logging.WARNING)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
 VANTAGE_HOST = os.getenv("VANTAGE_HOST")
 if not VANTAGE_HOST:
     raise ValueError("VANTAGE_HOST must be set in .env")
@@ -53,64 +77,15 @@ DISCOVERY_PREFIX = os.getenv("DISCOVERY_PREFIX", "homeassistant")
 AVAILABILITY_TOPIC = f"{BASE_TOPIC}/bridge/status"
 BRIDGE_DEVICE_ID = f"vantage_controller_{VANTAGE_HOST_SAFE}"
 
-# Tuning Knobs (The "Sniper" Configuration)
-# -----------------------------------------------------------------------------
-# POLL_INTERVAL: How often to force a full status check (safety net).
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "90"))
-
-# POLL_QUIET_TIME: Prevent polling if the system was active recently. 
-# Should match your longest fade time + 1s.
-POLL_QUIET_TIME = int(os.getenv("POLL_QUIET_TIME", "5"))
-
-# COMMAND_THROTTLE_DELAY: Sleep time between commands to prevent RS-232 buffer overflow.
-# 0.02s (20ms) is usually sufficient. 0.15s is safer for very old controllers.
-COMMAND_THROTTLE_DELAY = float(os.getenv("COMMAND_THROTTLE_DELAY", "0.02"))
-
-# PUBLISH_RAW_BUTTON_EVENTS: If True, floods MQTT with raw JSON for every button press.
-# Keep False unless debugging specific keypad IDs.
-PUBLISH_RAW_BUTTON_EVENTS = os.getenv("PUBLISH_RAW_BUTTON_EVENTS", "false").lower() == "true"
-
-# Timing Constants
+# --- TUNING ---
 RECONNECT_DELAY_MQTT = 10
 HEALTH_CHECK_INTERVAL = 30
 ENABLE_FALLBACK_POLLING = True
+POLL_INTERVAL = 90
+POLL_QUIET_TIME = 5 # Reduced to 5s so Sniper can fire quickly after a scene
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging Setup (Calm journald, Silent aiovantage)
-# ─────────────────────────────────────────────────────────────────────────────
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-_requested_level = getattr(logging, LOG_LEVEL, logging.INFO)
-ROOT_LEVEL = logging.INFO if _requested_level < logging.INFO else _requested_level
-
-root_logger = logging.getLogger()
-root_logger.setLevel(ROOT_LEVEL)
-
-for h in list(root_logger.handlers):
-    root_logger.removeHandler(h)
-
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-console = logging.StreamHandler()
-console.setLevel(ROOT_LEVEL)
-console.setFormatter(formatter)
-root_logger.addHandler(console)
-
-log = logging.getLogger("vantage_mqtt_bridge")
-
-# ARCHITECTURAL NOTE:
-# We silence the core 'aiovantage' library but keep it at DEBUG level internally.
-# This allows us to attach our _AiovantageTapHandler to intercept "EL:" (Event Log)
-# lines, which contain button press data that the API does not expose natively.
-aio_logger = logging.getLogger("aiovantage")
-aio_logger.setLevel(logging.DEBUG) 
-aio_logger.propagate = False
-
-for h in list(aio_logger.handlers):
-    aio_logger.removeHandler(h)
-
-logging.getLogger("aiomqtt").setLevel(logging.WARNING)
-
+# THROTTLE: 0.02s delay to prevent crashes
+COMMAND_THROTTLE_DELAY = 0.02
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -141,14 +116,10 @@ def slugify(name: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Aiovantage "Tap" Handler
+# Aiovantage "tap" logging handler
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _AiovantageTapHandler(logging.Handler):
-    """
-    Event Adapter: Intercepts 'EL:' debug lines from aiovantage and 
-    feeds them to the KeypadEventsBridge.
-    """
     def __init__(self, bridge: "KeypadEventsBridge"):
         super().__init__(level=logging.DEBUG)
         self.bridge = bridge
@@ -171,7 +142,7 @@ class _AiovantageTapHandler(logging.Handler):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Keypad Events Bridge (The Log Tap)
+# Keypad Events Bridge (With Sniper Trigger Re-Added)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KeypadEventsBridge:
@@ -182,16 +153,16 @@ class KeypadEventsBridge:
         self,
         vantage: Vantage,
         get_mqtt_client: callable,
-        poll_trigger: asyncio.Event,
+        poll_trigger: asyncio.Event, # <--- RESTORED
         base_prefix: str = "vantage",
         discovery_prefix: str = "homeassistant",
         learn_mode: bool = True,
         include_stations: Optional[Set[int]] = None,
-        publish_raw: bool = False,
+        publish_raw: bool = True,
     ):
         self.vantage = vantage
         self.get_mqtt_client = get_mqtt_client
-        self.poll_trigger = poll_trigger
+        self.poll_trigger = poll_trigger # <--- RESTORED
         self.base_prefix = base_prefix.rstrip("/")
         self.discovery_prefix = discovery_prefix.rstrip("/")
         self.learn_mode = learn_mode
@@ -201,12 +172,13 @@ class KeypadEventsBridge:
         self._discovered: Set[Tuple[int, int, str]] = set()
         self._loop = asyncio.get_running_loop()
         self._area_map: Dict[int, str] = {}
+        
+        # Exact working regex from v1.0.8
         self._regex = re.compile(r"EL:\s+(\d+)\s+([\w\.]+)\s+(-?\d+)")
         self._tap_handler: Optional[_AiovantageTapHandler] = None
 
     async def start(self) -> None:
-        log.info(f"Starting Keypad Bridge (Raw Publish: {self.publish_raw})...")
-
+        log.info("Starting Keypad Bridge (Silent Tap Mode)...")
         await self.vantage.buttons.initialize(fetch_state=True)
         await self.vantage.tasks.initialize(fetch_state=True)
 
@@ -216,7 +188,7 @@ class KeypadEventsBridge:
         except Exception:
             pass
 
-        # Hook aiovantage logger
+        # SAFE LOGGING HIJACK
         aio_log = logging.getLogger("aiovantage")
         for h in list(aio_log.handlers):
             aio_log.removeHandler(h)
@@ -226,11 +198,14 @@ class KeypadEventsBridge:
         self._tap_handler = _AiovantageTapHandler(self)
         aio_log.addHandler(self._tap_handler)
 
+        log.info(f"Keypad Bridge active.")
+
     def _handle_el_line(self, msg: str) -> None:
         try:
             match = self._regex.search(msg)
             if not match:
                 return
+
             vid = int(match.group(1))
             method = match.group(2)
             val = int(match.group(3))
@@ -259,16 +234,22 @@ class KeypadEventsBridge:
         if not isinstance(station_id, int):
             station_id = 0
 
-        station_name = station.name if station and hasattr(station, "name") else f"Keypad {station_id}"
-        if source_type == "task":
-            station_name = getattr(obj, "name", "Virtual Task")
-        
-        pos = getattr(obj, "location", None) or getattr(obj, "vid", vid)
+        station_name = "Unknown"
+        suggested_area = ""
+        pos = vid
+
         if source_type == "task":
             pos = vid
-
-        area_id = getattr(station, "area_id", 0) if station else getattr(obj, "area_id", 0)
-        suggested_area = self._area_map.get(area_id, "")
+            station_name = getattr(obj, "name", "Virtual Task")
+            area_id = getattr(obj, "area_id", 0)
+            suggested_area = self._area_map.get(area_id, "")
+        else:
+            pos = getattr(obj, "location", None) or getattr(obj, "vid", vid)
+            station_name = f"Keypad {station_id}"
+            if station and hasattr(station, "name"):
+                station_name = station.name
+            area_id = getattr(station, "area_id", 0) if station else 0
+            suggested_area = self._area_map.get(area_id, "")
 
         if self.include_stations and source_type == "button" and station_id not in self.include_stations:
             return
@@ -277,7 +258,13 @@ class KeypadEventsBridge:
         if action == "unknown":
             return
 
-        # (A) Raw Debug (Configurable)
+        # --- SNIPER LOGIC RESTORED ---
+        # If we see a PRESS, tell the main loop to wake up!
+        if action == "press" and self.poll_trigger:
+            log.info(f"Sniper Trigger: Button {pos} pressed. Scheduling fast poll.")
+            self.poll_trigger.set()
+        # -----------------------------
+
         if self.publish_raw:
             raw_topic = f"{self.base_prefix}/keypad/_raw"
             raw_payload = {
@@ -294,16 +281,7 @@ class KeypadEventsBridge:
             except Exception:
                 pass
 
-        # (B) Action Topic
         target_id = station_id if station_id != 0 else f"task_{vid}"
-        
-        # --- SNIPER LOGIC START ---
-        # Signal the main bridge that a physical event occurred.
-        # This triggers a "fast poll" after the scene settles.
-        if action == "press" and self.poll_trigger:
-            self.poll_trigger.set()
-        # --- SNIPER LOGIC END ---
-
         topic = f"{self.base_prefix}/keypad/{target_id}/button/{pos}/action"
 
         try:
@@ -312,7 +290,6 @@ class KeypadEventsBridge:
         except Exception:
             pass
 
-        # (C) Discovery
         if self.learn_mode and (target_id, pos, action) not in self._discovered:
             await self._publish_disc(mqtt, target_id, station_name, suggested_area, pos, topic, action, source_type)
             self._discovered.add((target_id, pos, action))
@@ -362,6 +339,7 @@ class VantageBridge:
         self._is_dimmable: Dict[int, bool] = {}
         self._obj_id_map: Dict[int, str] = {}
         self._area_names: Dict[int, str] = {}
+        self._modules: Dict[int, Any] = {}
         self._last_non_zero_level: Dict[int, float] = {}
         self._start_time = time.monotonic()
         self._process = psutil.Process(os.getpid())
@@ -369,6 +347,8 @@ class VantageBridge:
         self._last_event_time = time.monotonic()
         self._health_task: Optional[asyncio.Task] = None
         self._poll_task: Optional[asyncio.Task] = None
+        
+        # EVENT FOR SNIPER POLLING
         self._poll_trigger = asyncio.Event()
 
     def _ha_config_topic(self, component, object_id):
@@ -471,82 +451,42 @@ class VantageBridge:
                         await load_obj.turn_off()
                         await self._publish_load_state_async(load_id, 0.0)
                         # Throttle OFF commands too
-                        await asyncio.sleep(COMMAND_THROTTLE_DELAY) 
+                        await asyncio.sleep(COMMAND_THROTTLE_DELAY)
 
         except Exception as e:
             log.error(f"Error parsing MQTT cmd: {e}", exc_info=True)
 
     # ─────────────────────────────────────────────────────────────────────
-    # Load Control (With Throttle)
-    # ─────────────────────────────────────────────────────────────────────
-
-    async def _set_level(self, load_id: int, level: float, load: Optional[Any] = None):
-        """
-        Sets the load level with a THROTTLE to prevent serial buffer overflows.
-        """
-        if not self._vantage:
-            return
-        try:
-            if load is None:
-                load = self._loads.get(load_id) or await self._vantage.loads.aget(load_id)
-            if not load:
-                return
-
-            level = max(0.0, min(100.0, float(level)))
-            log.info(f"Setting load {load_id} to {level:.1f}%")
-
-            await load.set_level(level)
-
-            if level > 0:
-                self._last_non_zero_level[load_id] = level
-            await self._publish_load_state_async(load_id, level)
-
-            # --- THROTTLE START ---
-            # Prevents overwhelming the Vantage Serial Controller
-            await asyncio.sleep(COMMAND_THROTTLE_DELAY)
-            # --- THROTTLE END ---
-
-        except Exception as e:
-            log.error(f"Error setting level: {e}", exc_info=True)
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Discovery & Events
+    # Load Control & Discovery
     # ─────────────────────────────────────────────────────────────────────
 
     def _get_area_name(self, load):
+        area = getattr(load, "area", None)
+        if area and hasattr(area, "name"): return area.name
         aid = getattr(load, "area_id", 0)
         return self._area_names.get(aid, "Unassigned")
 
     async def _discover_loads(self):
-        if not self._vantage:
-            return
-
+        if not self._vantage: return
         log.info("Discovering loads...")
         self._area_names.clear()
-        for area in self._vantage.areas:
-            self._area_names[area.id] = area.name
-
+        for area in self._vantage.areas: self._area_names[area.id] = area.name
         await self._vantage.loads.initialize()
         self._loads.clear()
         self._last_non_zero_level.clear()
-
         grouped_loads: Dict[str, List[Any]] = defaultdict(list)
         for load in self._vantage.loads:
             self._loads[load.id] = load
             self._is_dimmable[load.id] = bool(getattr(load, "is_dimmable", True))
-            if load.level and load.level > 0:
-                self._last_non_zero_level[load.id] = load.level
+            if load.level and load.level > 0: self._last_non_zero_level[load.id] = load.level
             grouped_loads[slugify(getattr(load, "name", "load"))].append(load)
-
         self._obj_id_map.clear()
         for base_name, loads in grouped_loads.items():
             loads.sort(key=lambda x: x.id)
             for i, load in enumerate(loads):
                 oid = base_name if i == 0 else f"{base_name}_{i + 1}"
-                if "fan" in (load.name or "").lower():
-                    oid += "_load"
+                if "fan" in (load.name or "").lower(): oid += "_load"
                 self._obj_id_map[load.id] = oid
-
         await self._publish_bridge_device_async()
         for l in self._loads.values():
             await self._publish_discovery_for_load_async(l)
@@ -556,35 +496,67 @@ class VantageBridge:
 
     async def _handle_load_event(self, event=None, load=None, data=None, *args, **kwargs):
         self._last_event_time = time.monotonic()
-        if load is None:
-            load = kwargs.get("load")
-        if not load:
-            return
+        if load is None: load = kwargs.get("load")
+        if not load: return
         level = getattr(load, "level", None)
-        if level is None and isinstance(data, dict):
-            level = data.get("level", data.get("value"))
+        if level is None and isinstance(data, dict): level = data.get("level", data.get("value"))
         if level is not None:
             lvl = float(level)
-            if lvl > 0:
-                self._last_non_zero_level[load.id] = lvl
+            if lvl > 0: self._last_non_zero_level[load.id] = lvl
             await self._publish_load_state_async(load.id, lvl)
 
     def _subscribe_to_load_events(self):
         if self._vantage:
-            self._vantage.loads.subscribe("state_change", self._handle_load_event)
+            try: self._vantage.loads.subscribe("state_change", self._handle_load_event)
+            except Exception: pass
+
+    async def _set_level(self, load_id: int, level: float, load: Optional[Any] = None):
+        if not self._vantage: return
+        try:
+            if load is None:
+                load = self._loads.get(load_id) or await self._vantage.loads.aget(load_id)
+            if not load: return
+            level = max(0.0, min(100.0, float(level)))
+            log.info(f"Setting load {load_id} to {level:.1f}%")
+            await load.set_level(level)
+            if level > 0: self._last_non_zero_level[load_id] = level
+            await self._publish_load_state_async(load_id, level)
+            await asyncio.sleep(COMMAND_THROTTLE_DELAY)
+        except Exception as e:
+            log.error(f"Error setting level: {e}", exc_info=True)
 
     # ─────────────────────────────────────────────────────────────────────
-    # Publishing logic (Discovery, State, Diagnostics)
+    # Publishing Logic
     # ─────────────────────────────────────────────────────────────────────
-    # [Code identical to previous logic, abbreviated for brevity]
-    # Use standard discovery/publish methods...
+    
     async def _publish_bridge_offline_async(self):
-         # ... existing ...
-         pass
+        try:
+            will = Will(AVAILABILITY_TOPIC, b"offline", qos=1, retain=True)
+            async with Client(hostname=MQTT_HOST, port=MQTT_PORT, username=MQTT_USERNAME, password=MQTT_PASSWORD, will=will) as client:
+                await client.publish(AVAILABILITY_TOPIC, "offline", qos=1, retain=True)
+        except Exception: pass
 
     async def _publish_bridge_device_async(self):
-        # ... existing ...
-        pass
+        try:
+            oid = f"{BRIDGE_DEVICE_ID}_status"
+            topic = self._ha_config_topic("sensor", oid)
+            payload = {
+                "name": "Bridge Status",
+                "default_entity_id": f"sensor.{oid}",
+                "unique_id": f"{BRIDGE_DEVICE_ID}_status_sensor",
+                "state_topic": AVAILABILITY_TOPIC,
+                "icon": "mdi:bridge",
+                "device": {
+                    "identifiers": [BRIDGE_DEVICE_ID],
+                    "name": f"Vantage Controller ({VANTAGE_HOST})",
+                    "manufacturer": "Vantage",
+                    "model": "InFusion (SDK) Bridge",
+                    "sw_version": "1.1.1-SniperFix",
+                },
+                "entity_category": "diagnostic",
+            }
+            await self._publish_async(topic, json.dumps(payload), retain=True, qos=1)
+        except Exception: pass
 
     async def _publish_all_discovery_async(self):
         await self._publish_bridge_device_async()
@@ -593,12 +565,9 @@ class VantageBridge:
             await self._publish_attributes_for_load_async(l)
 
     async def _publish_discovery_for_load_async(self, load):
-        # ... (Same logic as provided source) ...
-        # Ensure we use self._obj_id_map
         if not self._mqtt_connected: return
         oid = self._obj_id_map.get(load.id)
         if not oid: return
-        
         topic = self._ha_config_topic("light", oid)
         safe_dev_id = f"vantage_{VANTAGE_HOST_SAFE}_load_{load.id}"
         payload = {
@@ -623,11 +592,7 @@ class VantageBridge:
 
     async def _publish_attributes_for_load_async(self, load):
         attr_topic = self._topic("light", load.id, "attributes")
-        attrs = {
-            "vantage_area": self._get_area_name(load),
-            "vantage_id": load.id,
-            "vantage_name": getattr(load, "name", "load"),
-        }
+        attrs = { "vantage_area": self._get_area_name(load), "vantage_id": load.id, "vantage_name": getattr(load, "name", "load") }
         await self._publish_async(attr_topic, json.dumps(attrs), retain=True, qos=1)
 
     async def _publish_load_state_async(self, load_id, level):
@@ -663,22 +628,28 @@ class VantageBridge:
                 await self._publish_diagnostics_async()
 
     async def _poll_loop(self):
-        log.info(f"Starting Sniper Polling Loop (Interval: {POLL_INTERVAL}s, Quiet: {POLL_QUIET_TIME}s).")
-        await asyncio.sleep(10)
+        log.info(f"Starting Smart Polling Loop (Interval: {POLL_INTERVAL}s).")
+        await asyncio.sleep(10) # Initial grace period
 
         while not self._shutdown_requested:
             try:
+                # WAIT FOR EITHER:
+                # 1. 90 seconds (Normal Loop)
+                # 2. Sniper Trigger (Button Press)
                 await asyncio.wait_for(self._poll_trigger.wait(), timeout=POLL_INTERVAL)
-                log.info("Sniper Trigger Detected. Waiting for scene to finish...")
+                
+                # If we get here, the Sniper triggered!
+                log.info("Sniper Trigger Detected. Waiting 5s for scene to finish...")
                 self._poll_trigger.clear()
                 
-                # Wait for the Vantage Scene to ramp/finish (Default 5s)
+                # Wait for the fade to complete
                 await asyncio.sleep(5)
                 
             except asyncio.TimeoutError:
+                # Normal 90s timeout - just continue to check
                 pass
 
-            # Smart Check: Don't poll if we just got live data recently
+            # Smart Check: Don't poll if we just got live data
             time_since_activity = time.monotonic() - self._last_event_time
             if time_since_activity < POLL_QUIET_TIME:
                 continue
@@ -701,10 +672,9 @@ class VantageBridge:
     # ─────────────────────────────────────────────────────────────────────
 
     async def run(self):
-        log.info("Starting Vantage MQTT Bridge...")
+        log.info("Starting Vantage MQTT Bridge (v1.1.1-SniperFix)...")
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                self._loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.stop(s)))
+            try: self._loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.stop(s)))
             except NotImplementedError: pass
 
         self._mqtt_task = self._loop.create_task(self._mqtt_loop())
@@ -716,42 +686,34 @@ class VantageBridge:
                     log.info("Vantage connected.")
                     self._vantage = vantage
                     self._last_event_time = time.monotonic()
-
                     await vantage.areas.initialize()
                     await vantage.modules.initialize()
                     await self._discover_loads()
                     self._subscribe_to_load_events()
 
-                    # Start Keypad Bridge (Passed Config Params)
+                    # Start Keypad Bridge (Pass Poll Trigger!)
                     self._keypad_bridge = KeypadEventsBridge(
                         vantage,
                         self.get_mqtt_client,
-                        self._poll_trigger,
+                        self._poll_trigger, # <--- RESTORED THE WIRE!
                         BASE_TOPIC,
                         DISCOVERY_PREFIX,
                         learn_mode=True,
-                        publish_raw=PUBLISH_RAW_BUTTON_EVENTS, # <--- Configurable
+                        publish_raw=True,
                     )
                     await self._keypad_bridge.start()
 
-                    if not self._health_task:
-                        self._health_task = self._loop.create_task(self._health_check_loop())
-                    if ENABLE_FALLBACK_POLLING and not self._poll_task:
-                        self._poll_task = self._loop.create_task(self._poll_loop())
+                    if not self._health_task: self._health_task = self._loop.create_task(self._health_check_loop())
+                    if ENABLE_FALLBACK_POLLING and not self._poll_task: self._poll_task = self._loop.create_task(self._poll_loop())
+                    if self._mqtt_connected: await self._publish_async(AVAILABILITY_TOPIC, "online", retain=True, qos=1)
 
-                    if self._mqtt_connected:
-                        await self._publish_async(AVAILABILITY_TOPIC, "online", retain=True, qos=1)
+                    while not self._shutdown_requested: await asyncio.sleep(1)
 
-                    while not self._shutdown_requested:
-                        await asyncio.sleep(1)
-
-            except asyncio.CancelledError:
-                break
+            except asyncio.CancelledError: break
             except Exception as e:
                 log.error(f"Vantage connection error: {e}")
                 self._vantage = None
-                if not self._shutdown_requested:
-                    await asyncio.sleep(RECONNECT_DELAY_MQTT)
+                if not self._shutdown_requested: await asyncio.sleep(RECONNECT_DELAY_MQTT)
 
     async def stop(self, sig=None):
         if self._shutdown_requested: return
