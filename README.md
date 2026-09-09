@@ -1,6 +1,6 @@
 # Vantage (InFusion) MQTT Bridge for Home Assistant
 
-**Version:** 1.1.0 (Sniper Edition)
+**Version:** 1.1.2 (SniperFix + Task Switches)
 
 A standalone, high-reliability Python bridge that connects **Legrand Vantage InFusion** lighting controllers to **Home Assistant** via **MQTT**.
 
@@ -20,6 +20,13 @@ This project runs as a **separate service** (decoupled from Home Assistant) and 
 
 3. **Scene blindness / stale state**  
    Some controllers execute keypad macros/scenes but don’t reliably broadcast resulting load state changes.
+
+> **Legacy-controller coexistence:** Avoid running this bridge alongside other
+> clients that poll the same controller aggressively. In the original installation,
+> an RTI integration polling every second materially contributed to controller
+> hangs. Consolidating control through one bridge and disabling that polling client
+> was an important part of the stability improvement. This does not imply that the
+> official Home Assistant integration is unstable in every installation.
 
 ---
 
@@ -59,6 +66,13 @@ Instead of constant polling:
 ### 4) Serial throttling (crash protection)
 Adds micro-delays between outgoing commands to prevent controller buffer overflows.
 
+### 5) Opt-in stateful task switches
+
+Vantage tasks are discovered and named from controller metadata. Tasks explicitly
+listed by name in `TASK_SWITCH_NAMES` are exposed as bidirectional MQTT switches.
+The name must match exactly and uniquely, preventing a numeric task ID copied from
+another Vantage project from controlling the wrong program.
+
 ---
 
 ## Requirements
@@ -79,7 +93,7 @@ cd Vantage---MQTT-bridge-for-Home-Assistant
 
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock
 ```
 
 ### 2) Configure
@@ -154,8 +168,12 @@ sudo systemctl status vantage-bridge.service
 | `MQTT_TLS_ENABLED` | `false` | Enables TLS (basic toggle; see Notes) |
 | `BASE_TOPIC` | `vantage` | Root topic for bridge topics |
 | `DISCOVERY_PREFIX` | `homeassistant` | HA MQTT discovery prefix |
+| `TASK_SWITCH_NAMES` | *(empty)* | Comma-separated exact names of persistent tasks to expose as HA switches |
 
-### Tuning knobs (Sniper behavior)
+### Sniper behavior
+
+The production-proven defaults currently live as constants in `vantage_bridge.py`:
+
 | Setting | Default | Description |
 |---|---:|---|
 | `POLL_INTERVAL` | `90` | Safety-net: force a full status check periodically |
@@ -166,7 +184,9 @@ sudo systemctl status vantage-bridge.service
 | Setting | Default | Description |
 |---|---:|---|
 | `LOG_LEVEL` | `INFO` | Bridge log level |
-| `PUBLISH_RAW_BUTTON_EVENTS` | `false` | Publishes raw JSON for every detected keypad event |
+
+Raw keypad/task JSON is published to `BASE_TOPIC/keypad/_raw` to support lazy
+discovery and troubleshooting.
 
 **Notes**
 - TLS is currently a simple “on/off” toggle. If your broker requires CA/cert configuration, you may need to extend TLS settings in code.
@@ -180,6 +200,20 @@ The bridge attaches a custom `logging.Handler` to the `aiovantage` debug stream 
 - task running state changes (virtual tasks)
 
 On first sight of a button/task action, it publishes HA MQTT device trigger discovery and then publishes subsequent actions to MQTT.
+
+### Stateful task switches
+
+Most Vantage tasks are momentary scenes or internal programs and should not be
+represented as switches. To expose a persistent task such as a travel/vacation
+mode, list its exact controller name:
+
+```dotenv
+TASK_SWITCH_NAMES=Travel
+```
+
+Multiple persistent tasks may be comma-separated. The bridge discovers their IDs
+and verifies that each configured name is unique before accepting Start/Stop
+commands. An empty setting exposes no controllable tasks.
 
 ---
 
@@ -275,7 +309,9 @@ action:
 
 ### Keypads / tasks
 - Action topic: `BASE_TOPIC/keypad/<station_or_task>/button/<pos>/action` → `press` / `release`
-- Raw debug (optional): `BASE_TOPIC/keypad/_raw` → JSON
+- Raw event stream: `BASE_TOPIC/keypad/_raw` → JSON
+- Stateful task state: `BASE_TOPIC/task/<id>/state` → `ON` / `OFF`
+- Stateful task command: `BASE_TOPIC/task/<id>/set` → `ON` / `OFF`
 
 ### Bridge status
 - Availability: `BASE_TOPIC/bridge/status` → `online` / `offline`
@@ -317,6 +353,12 @@ If your broker requires custom CA certificates or mutual TLS, you may need to ex
 ### 4) Entity model follows what works in HA
 Loads are published as MQTT lights (with brightness topics). Some non-dimmable loads may still appear with brightness controls depending on the controller metadata. This is intentional to avoid changing entity types mid-stream and breaking dashboards/automations.
 
+### 5) Task entity type cannot be inferred safely
+Vantage exposes momentary scenes, internal programs, and persistent modes through
+the same Task interface. For safety, only names explicitly listed in
+`TASK_SWITCH_NAMES` become controllable switches. Other observed tasks remain
+automation triggers.
+
 
 ## Troubleshooting
 
@@ -342,4 +384,3 @@ Loads are published as MQTT lights (with brightness topics). Some non-dimmable l
 ## Credits
 
 - `loopj` for `aiovantage` and related Vantage tooling
-

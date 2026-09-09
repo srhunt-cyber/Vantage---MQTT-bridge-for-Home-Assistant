@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vantage <-> MQTT bridge
-Version 1.1.1-SniperFix
+Version 1.1.2-SniperFix-TaskSwitch
 
 - BASE: v1.0.9 (Safe Logging + Throttle).
 - FIX: Re-connected the "Sniper" trigger so button presses force an immediate poll.
@@ -76,6 +76,43 @@ DISCOVERY_PREFIX = os.getenv("DISCOVERY_PREFIX", "homeassistant")
 
 AVAILABILITY_TOPIC = f"{BASE_TOPIC}/bridge/status"
 BRIDGE_DEVICE_ID = f"vantage_controller_{VANTAGE_HOST_SAFE}"
+
+def _parse_task_switch_names(value: str) -> Dict[str, str]:
+    """Parse a comma-separated allowlist while matching names case-insensitively."""
+    names: Dict[str, str] = {}
+    for item in value.split(","):
+        name = item.strip()
+        if name:
+            names[name.casefold()] = name
+    return names
+
+
+# Empty by default: no Vantage task can be commanded unless its name is listed.
+# The bridge discovers each matching task's numeric VID from the controller.
+TASK_SWITCH_NAMES = _parse_task_switch_names(
+    os.getenv("TASK_SWITCH_NAMES", "")
+)
+
+
+def _is_unique_task_switch(vantage: Vantage, task: Any) -> bool:
+    """Allow a task only when its configured name uniquely identifies it."""
+    actual_name = getattr(task, "name", "")
+    name_key = actual_name.casefold()
+    if name_key not in TASK_SWITCH_NAMES:
+        return False
+
+    matches = [
+        candidate
+        for candidate in vantage.tasks
+        if getattr(candidate, "name", "").casefold() == name_key
+    ]
+    if len(matches) != 1:
+        log.error(
+            f"Refusing task name {actual_name!r}: expected one controller match, "
+            f"found {len(matches)}"
+        )
+        return False
+    return getattr(matches[0], "id", None) == getattr(task, "id", None)
 
 # --- TUNING ---
 RECONNECT_DELAY_MQTT = 10
@@ -258,6 +295,11 @@ class KeypadEventsBridge:
         if action == "unknown":
             return
 
+        # Task.IsRunning is the authoritative state for explicitly allowlisted
+        # long-running tasks. This uses the log tap and adds no task polling.
+        if source_type == "task" and _is_unique_task_switch(self.vantage, obj):
+            await self._publish_task_switch(mqtt, obj, val, vid)
+
         # --- SNIPER LOGIC RESTORED ---
         # If we see a PRESS, tell the main loop to wake up!
         if action == "press" and self.poll_trigger:
@@ -320,6 +362,44 @@ class KeypadEventsBridge:
             await mqtt.publish(disc_topic, json.dumps(payload), qos=1, retain=True)
         except Exception:
             pass
+
+    async def _publish_task_switch(self, mqtt, task, val, task_id) -> None:
+        """Publish controller-confirmed task state and HA switch discovery."""
+        name = getattr(task, "name", f"Task {task_id}")
+        state_topic = f"{self.base_prefix}/task/{task_id}/state"
+        command_topic = f"{self.base_prefix}/task/{task_id}/set"
+        disc_topic = (
+            f"{self.discovery_prefix}/switch/{self.base_prefix}/"
+            f"task_{task_id}/config"
+        )
+        payload = {
+            "name": name,
+            "unique_id": f"vantage_{VANTAGE_HOST_SAFE}_task_{task_id}",
+            "state_topic": state_topic,
+            "command_topic": command_topic,
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "availability_topic": AVAILABILITY_TOPIC,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "device": {
+                "identifiers": [f"vantage_kp_task_{task_id}"],
+                "name": name,
+                "manufacturer": self.MANUFACTURER,
+                "model": "Vantage Task",
+                "via_device": BRIDGE_DEVICE_ID,
+            },
+        }
+        try:
+            await mqtt.publish(disc_topic, json.dumps(payload), qos=1, retain=True)
+            await mqtt.publish(
+                state_topic,
+                "ON" if val == 1 else "OFF",
+                qos=1,
+                retain=True,
+            )
+        except Exception as e:
+            log.warning(f"Unable to publish task {task_id} state/discovery: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,6 +472,8 @@ class VantageBridge:
 
                     await client.subscribe(self._topic("light", "+", "set"), qos=1)
                     await client.subscribe(self._topic("light", "+", "brightness", "set"), qos=1)
+                    if TASK_SWITCH_NAMES:
+                        await client.subscribe(self._topic("task", "+", "set"), qos=1)
 
                     async for message in client.messages:
                         try:
@@ -452,6 +534,33 @@ class VantageBridge:
                         await self._publish_load_state_async(load_id, 0.0)
                         # Throttle OFF commands too
                         await asyncio.sleep(COMMAND_THROTTLE_DELAY)
+
+            elif (
+                len(parts) == 4
+                and parts[0] == BASE_TOPIC
+                and parts[1] == "task"
+                and parts[3] == "set"
+            ):
+                if not self._vantage:
+                    return
+
+                task_id = int(parts[2])
+                task = self._vantage.tasks.get(task_id)
+                if not task:
+                    log.warning(f"MQTT command references unknown task {task_id}")
+                    return
+
+                if not _is_unique_task_switch(self._vantage, task):
+                    log.warning(f"Ignoring command for non-allowlisted task {task_id}")
+                    return
+
+                command = payload.upper()
+                if command == "ON":
+                    log.info(f"Starting Vantage task {task_id} ({task.name})")
+                    await task.start()
+                elif command == "OFF":
+                    log.info(f"Stopping Vantage task {task_id} ({task.name})")
+                    await task.stop()
 
         except Exception as e:
             log.error(f"Error parsing MQTT cmd: {e}", exc_info=True)
@@ -551,7 +660,7 @@ class VantageBridge:
                     "name": f"Vantage Controller ({VANTAGE_HOST})",
                     "manufacturer": "Vantage",
                     "model": "InFusion (SDK) Bridge",
-                    "sw_version": "1.1.1-SniperFix",
+                    "sw_version": "1.1.2-SniperFix-TaskSwitch",
                 },
                 "entity_category": "diagnostic",
             }
@@ -672,7 +781,7 @@ class VantageBridge:
     # ─────────────────────────────────────────────────────────────────────
 
     async def run(self):
-        log.info("Starting Vantage MQTT Bridge (v1.1.1-SniperFix)...")
+        log.info("Starting Vantage MQTT Bridge (v1.1.2-SniperFix-TaskSwitch)...")
         for sig in (signal.SIGINT, signal.SIGTERM):
             try: self._loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.stop(s)))
             except NotImplementedError: pass
